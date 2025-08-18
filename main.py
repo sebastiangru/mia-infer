@@ -2,6 +2,11 @@
 from typing import Any, Dict, List, Union
 import numpy as np
 import pandas as pd
+from fastapi import FastAPI
+
+# MUST be before any @app.get/@app.post decorators
+app = FastAPI(title="MIA Infer", version="v4.0.2")
+
 from fastapi import Body, HTTPException
 
 # Keep your existing BLOB loading and BUNDLE wiring.
