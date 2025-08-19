@@ -1,133 +1,304 @@
-# --- add/imports near the top of main.py ---
-from typing import Any, Dict, List, Union
+# main.py
+import os
+import io
+import json
+import traceback
+from typing import Any, Dict, List, Optional, Tuple
+
+import joblib
 import numpy as np
 import pandas as pd
-from fastapi import FastAPI
+from fastapi import FastAPI, Body, HTTPException
+from pydantic import BaseModel, Field
+from azure.storage.blob import BlobClient
 
-# MUST be before any @app.get/@app.post decorators
-app = FastAPI(title="MIA Infer", version="v4.0.2")
+# Optional: load .env locally during dev
+try:
+    from dotenv import load_dotenv  # type: ignore
+    load_dotenv()
+except Exception:
+    pass
 
-from fastapi import Body, HTTPException
+APP_VERSION = os.getenv("APP_VERSION", "v1.0.0")
 
-# Keep your existing BLOB loading and BUNDLE wiring.
-# We assume you already have something like:
-# BUNDLE = {"model": booster, "version": "v4.0.1", "features": [...]}
-# TIMEFRAME = os.getenv("TIMEFRAME", "1d")
+# ---------------------------------------------------------------------
+# Configuration helpers
+# ---------------------------------------------------------------------
 
-def _get_model_and_features():
-    """Return (booster, features_list). Try to read features from model."""
-    if BUNDLE is None or "model" not in BUNDLE or BUNDLE["model"] is None:
-        raise RuntimeError("Model not loaded")
-    booster = BUNDLE["model"]
+def _env(name: str, default: Optional[str] = None) -> Optional[str]:
+    v = os.getenv(name, default)
+    return v if v not in ("", None) else default
 
-    # Prefer model feature names if available
-    feats = None
+def resolve_model_url(env_url_name: str, env_file_name: str, base_env: str = "MODELS_BLOB") -> Optional[str]:
+    """
+    Resolve a model location from either a full URL (e.g. LGBM_REG_URL)
+    or a filename combined with MODELS_BLOB (e.g. LGBM_REG_FILE).
+    """
+    direct = _env(env_url_name)
+    if direct:
+        return direct
+    base = _env(base_env)
+    fname = _env(env_file_name)
+    if base and fname:
+        if base.endswith("/"):
+            return base + fname
+        return base + "/" + fname
+    return None
+
+# ---------------------------------------------------------------------
+# I/O: load joblib from Blob URL (works for public or SAS-protected blobs)
+# ---------------------------------------------------------------------
+
+def load_joblib_from_url(url: str):
     try:
-        if hasattr(booster, "feature_name"):
-            feats = booster.feature_name()
-            # LightGBM can return None if not set; ensure list
-            if feats is None:
-                feats = []
+        bc = BlobClient.from_blob_url(url)
+        data = bc.download_blob().readall()
+        return joblib.load(io.BytesIO(data))
+    except Exception as e:
+        # Fallback: if azure client fails, try plain HTTP GET if accessible
+        try:
+            import requests  # lazy import
+            r = requests.get(url, timeout=30)
+            r.raise_for_status()
+            return joblib.load(io.BytesIO(r.content))
+        except Exception as e2:
+            raise RuntimeError(f"Failed to load joblib from URL: {url}\nPrimary error: {e}\nHTTP fallback error: {e2}")
+
+# ---------------------------------------------------------------------
+# Models & feature name helpers
+# ---------------------------------------------------------------------
+
+class LoadedModels(BaseModel):
+    lgbm_reg: Any | None = None
+    lgbm_clf: Any | None = None
+    xgb_reg: Any | None = None
+    xgb_clf: Any | None = None
+    lgbm_q10: Any | None = None   # optional quantile regressor
+    lgbm_q90: Any | None = None
+
+models = LoadedModels()
+
+def _feature_names_from_model(m) -> Optional[List[str]]:
+    """
+    Try to pull the expected feature names list from LightGBM or XGBoost models.
+    """
+    if m is None:
+        return None
+    # LightGBM sklearn wrapper
+    fn = getattr(m, "feature_name_", None)
+    if fn:
+        return list(fn)
+    booster = getattr(m, "booster_", None)
+    if booster is not None:
+        try:
+            return list(booster.feature_name())
+        except Exception:
+            pass
+    # XGBoost sklearn wrapper
+    try:
+        booster = m.get_booster()
+        if booster is not None and booster.feature_names:
+            return list(booster.feature_names)
     except Exception:
-        feats = []
+        pass
+    return None
 
-    # Fall back to features saved in bundle, or a conservative default list
-    if not feats:
-        feats = BUNDLE.get("features") or [
-            # Safest guess based on your training:
-            "ret1","logret1",
-            "sma20","sma50","sma200",
-            "ema12","ema26",
-            "macd","macd_signal","macd_hist",
-            "rsi14","atr14","vol20","bb_width",
-            # add any other engineered features you trained with
-        ]
-    return booster, list(feats)
-
-def _to_frame_from_rows(rows: Union[List[Dict[str, Any]], Dict[str, Any]]) -> pd.DataFrame:
-    """Normalize incoming payload (list of dicts or dict) -> DataFrame with lowercase columns."""
-    if isinstance(rows, dict):
-        # accept { ... } and wrap as single row
-        rows = [rows]
-    if not isinstance(rows, list) or not rows:
-        raise HTTPException(status_code=400, detail="Payload must be a non-empty JSON array or object")
-
-    df = pd.DataFrame(rows)
-    if df.empty:
-        raise HTTPException(status_code=400, detail="No rows found in payload")
-
-    # Normalize column names
-    df.columns = [str(c).strip().lower() for c in df.columns]
-    # Keep time/symbol/timeframe if present (for echoing back), but not required for prediction
-    return df
-
-def _coerce_numeric(df: pd.DataFrame, use_features: List[str]) -> pd.DataFrame:
-    """Ensure numeric dtype for features; add missing features as NaN; order columns."""
-    # Make sure the requested feature set exists as columns
-    df2 = df.copy()
-
-    # Add any missing model features as NaN
-    for c in use_features:
-        if c not in df2.columns:
-            df2[c] = np.nan
-
-    # Convert features to numeric
-    for c in use_features:
-        df2[c] = pd.to_numeric(df2[c], errors="coerce")
-
-    # Final matrix in the model's feature order
-    X = df2[use_features]
-    return X
-
-@app.post("/predict", tags=["inference"])
-def predict(
-    rows: Union[List[Dict[str, Any]], Dict[str, Any]] = Body(..., example=[{"symbol":"AMZN","time":"2025-03-25T13:30:00Z", "ret1":0.01, "ema12":205.7, "ema26":205.7, "macd":0}]),
-    thr: float = 0.50,          # optional: classification threshold in response
-):
+def _align_features(x: pd.DataFrame, expected: Optional[List[str]]) -> Tuple[pd.DataFrame, List[str]]:
     """
-    Accepts either:
-      - a JSON array of candle dicts (what n8n sends), or
-      - a single candle dict.
-    Returns per-row probabilities and a 'latest' summary (last row).
+    Reindex incoming features to expected names; drop extras; fill missing with 0.
+    Returns (X_aligned, warnings).
     """
-    try:
-        booster, feats = _get_model_and_features()
-    except Exception as e:
-        raise HTTPException(status_code=503, detail=f"Model not loaded: {e}")
+    warnings: List[str] = []
+    if expected is None:
+        warnings.append("No feature_name info on model; using provided features as-is.")
+        return x, warnings
+    # Extra cols
+    extra = [c for c in x.columns if c not in expected]
+    if extra:
+        warnings.append(f"Dropping unexpected features: {extra}")
+    # Missing cols
+    missing = [c for c in expected if c not in x.columns]
+    if missing:
+        warnings.append(f"Missing features not provided; filling with 0: {missing}")
+    X = x.reindex(columns=expected, fill_value=0.0)
+    return X, warnings
 
-    df = _to_frame_from_rows(rows)
+# ---------------------------------------------------------------------
+# Pydantic request/response schemas
+# ---------------------------------------------------------------------
 
-    # Prepare feature matrix in exact model order
-    X = _coerce_numeric(df, feats)
+class ScoreRequest(BaseModel):
+    symbol: str = Field(..., description="Ticker (e.g., AMZN)")
+    tf: str = Field("1d", description="Timeframe like 15m, 1h, 1d")
+    features: Dict[str, float] = Field(..., description="Flat dict of feature_name -> value")
+    timestamp: Optional[str] = Field(None, description="ISO time of the bar (optional)")
 
-    # LightGBM binary models return class probabilities by default
-    try:
-        yhat = booster.predict(X, num_iteration=getattr(booster, "best_iteration", None))
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Prediction failed: {e}")
+class ScoreResponse(BaseModel):
+    symbol: str
+    tf: str
+    yhat_lgbm: Optional[float] = None
+    yhat_xgb: Optional[float] = None
+    yhat_ens: Optional[float] = None
+    p_up_lgbm: Optional[float] = None
+    p_up_xgb: Optional[float] = None
+    p_up_ens: Optional[float] = None
+    q_lo: Optional[float] = None
+    q_hi: Optional[float] = None
+    meta: Dict[str, Any]
 
-    # Build row-wise results
-    # Echo back symbol/time if present
-    echo_cols = [c for c in ["symbol","time","timeframe","open","high","low","close","volume"] if c in df.columns]
-    results = []
-    for i, p in enumerate(yhat):
-        row = {k: (None if pd.isna(df.at[i, k]) else df.at[i, k]) for k in echo_cols}
-        row.update({
-            "p_up": float(p),
-            "signal": "BUY" if p >= thr else "HOLD/SELL",
-        })
-        results.append(row)
+# ---------------------------------------------------------------------
+# FastAPI app
+# ---------------------------------------------------------------------
 
-    # Latest = last row in the payload
-    latest = results[-1] if results else None
+app = FastAPI(title="MIA Inference Service", version=APP_VERSION)
 
-    return {
-        "ok": True,
-        "version": BUNDLE.get("version", "unknown"),
-        "timeframe": os.getenv("TIMEFRAME", "1d"),
-        "features_used": feats,
-        "n_rows": len(results),
-        "threshold": thr,
-        "latest": latest,
-        "rows": results,
+def _load_all_models():
+    # Resolve URLs (either *_URL or *_FILE + MODELS_BLOB)
+    urls = {
+        "lgbm_reg": resolve_model_url("LGBM_REG_URL", "LGBM_REG_FILE"),
+        "lgbm_clf": resolve_model_url("LGBM_CLF_URL", "LGBM_CLF_FILE"),
+        "xgb_reg":  resolve_model_url("XGB_REG_URL",  "XGB_REG_FILE"),
+        "xgb_clf":  resolve_model_url("XGB_CLF_URL",  "XGB_CLF_FILE"),
+        "lgbm_q10": resolve_model_url("LGBM_Q10_URL", "LGBM_Q10_FILE"),
+        "lgbm_q90": resolve_model_url("LGBM_Q90_URL", "LGBM_Q90_FILE"),
     }
+    loaded = {}
+    for k, url in urls.items():
+        if not url:
+            loaded[k] = None
+            continue
+        loaded[k] = load_joblib_from_url(url)
+    return LoadedModels(**loaded)
+
+@app.on_event("startup")
+def _startup():
+    global models
+    models = _load_all_models()
+
+@app.get("/health")
+def health():
+    ok = (models.lgbm_reg is not None) or (models.xgb_reg is not None)
+    return {"ok": ok, "version": APP_VERSION}
+
+@app.get("/ready")
+def ready():
+    ok = all([
+        (models.lgbm_reg is not None),
+        (models.lgbm_clf is not None),
+        (models.xgb_reg  is not None),
+        (models.xgb_clf  is not None),
+    ])
+    return {"ready": ok, "version": APP_VERSION}
+
+@app.get("/modelinfo")
+def modelinfo():
+    info = {}
+    for name in ["lgbm_reg","lgbm_clf","xgb_reg","xgb_clf","lgbm_q10","lgbm_q90"]:
+        m = getattr(models, name)
+        if m is None:
+            info[name] = {"loaded": False}
+        else:
+            info[name] = {
+                "loaded": True,
+                "feature_names": _feature_names_from_model(m)
+            }
+    return {"version": APP_VERSION, "models": info}
+
+@app.post("/reload")
+def reload_models():
+    global models
+    try:
+        models = _load_all_models()
+        return {"ok": True, "version": APP_VERSION}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+@app.post("/score", response_model=ScoreResponse)
+def score(req: ScoreRequest = Body(...)):
+    if not req.features:
+        raise HTTPException(400, "Missing 'features'")
+
+    # Convert to single-row DataFrame
+    x_in = pd.DataFrame([req.features])
+
+    warnings: List[str] = []
+    yhat_l = yhat_x = None
+    p_l = p_x = None
+    q_lo = q_hi = None
+
+    # Regression heads
+    if models.lgbm_reg is not None:
+        exp = _feature_names_from_model(models.lgbm_reg)
+        Xl, w = _align_features(x_in, exp)
+        warnings.extend(w)
+        yhat_l = float(models.lgbm_reg.predict(Xl)[0])
+    if models.xgb_reg is not None:
+        exp = _feature_names_from_model(models.xgb_reg)
+        Xx, w = _align_features(x_in, exp)
+        warnings.extend(w)
+        yhat_x = float(models.xgb_reg.predict(Xx)[0])
+
+    # Classification heads (prob up)
+    if models.lgbm_clf is not None:
+        exp = _feature_names_from_model(models.lgbm_clf)
+        Xlc, w = _align_features(x_in, exp)
+        warnings.extend(w)
+        try:
+            p_l = float(models.lgbm_clf.predict_proba(Xlc)[:,1][0])
+        except Exception:
+            # Some calibrated wrappers are stored directly as 'calibrated' model
+            p_l = float(models.lgbm_clf.predict_proba(Xlc)[:,1][0])
+    if models.xgb_clf is not None:
+        exp = _feature_names_from_model(models.xgb_clf)
+        Xxc, w = _align_features(x_in, exp)
+        warnings.extend(w)
+        p_x = float(models.xgb_clf.predict_proba(Xxc)[:,1][0])
+
+    # Optional quantile heads (q10/q90)
+    if models.lgbm_q10 is not None:
+        exp = _feature_names_from_model(models.lgbm_q10)
+        Xq10, w = _align_features(x_in, exp)
+        warnings.extend(w)
+        q_lo = float(models.lgbm_q10.predict(Xq10)[0])
+    if models.lgbm_q90 is not None:
+        exp = _feature_names_from_model(models.lgbm_q90)
+        Xq90, w = _align_features(x_in, exp)
+        warnings.extend(w)
+        q_hi = float(models.lgbm_q90.predict(Xq90)[0])
+
+    # Simple ensemble
+    W_LGBM = float(_env("W_LGBM", "0.5"))
+    W_XGB  = float(_env("W_XGB",  "0.5"))
+    yhat_ens = None
+    if (yhat_l is not None) or (yhat_x is not None):
+        a = yhat_l if yhat_l is not None else 0.0
+        b = yhat_x if yhat_x is not None else 0.0
+        yhat_ens = W_LGBM * a + W_XGB * b
+
+    # Noisy-OR for combining probabilities
+    p_up_ens = None
+    if (p_l is not None) and (p_x is not None):
+        p_up_ens = 1.0 - (1.0 - p_l) * (1.0 - p_x)
+    elif p_l is not None:
+        p_up_ens = p_l
+    elif p_x is not None:
+        p_up_ens = p_x
+
+    meta = {
+        "version": APP_VERSION,
+        "warnings": warnings or None
+    }
+
+    return ScoreResponse(
+        symbol=req.symbol,
+        tf=req.tf,
+        yhat_lgbm=yhat_l,
+        yhat_xgb=yhat_x,
+        yhat_ens=yhat_ens,
+        p_up_lgbm=p_l,
+        p_up_xgb=p_x,
+        p_up_ens=p_up_ens,
+        q_lo=q_lo,
+        q_hi=q_hi,
+        meta=meta
+    )
