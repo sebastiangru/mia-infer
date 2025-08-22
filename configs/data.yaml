@@ -1,0 +1,7 @@
+price_base: "market-data/market-data/1d"
+macro_base: "market-data/macro/1d"
+universe_csv: "configs/universe.csv"
+benchmark: "SPY"
+join_strategy: "left"
+macro_ffill: true
+drop_na_after_join: true
