@@ -528,7 +528,7 @@ def main():
             n_jobs=-1,
             verbose=-1,
         )
-        clf.fit(X_tr_sc, y_tr_bin, eval_set=[(X_va_sc, y_va_bin)], callbacks=callbacks)
+        clf.fit(X_tr_sc, y_tr_bin, eval_set=[(X_va_sc, y_va_bin)], eval_metric="auc", callbacks=callbacks)
 
         p_va = clf.predict_proba(X_va_sc)[:, 1]
         oof_p.loc[X_va_sc.index] = p_va
@@ -586,7 +586,7 @@ def main():
         reg_lambda=args.lambda_l2,
         class_weight=args.class_weight,
         n_jobs=-1,
-        verbose=-1,
+        verbosity=-1,
     )
     clf_full.fit(X_full, y_bin, callbacks=[lgb.log_evaluation(period=0)] if args.quiet_lgbm else None)
 

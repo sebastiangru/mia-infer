@@ -1,0 +1,33 @@
+{
+  "n_samples": 34779,
+  "n_features": 59,
+  "symbols_loaded": 15,
+  "symbols_skipped": 0,
+  "n_splits": 5,
+  "embargo_days": 10,
+  "oof": {
+    "rmse": 0.9935622645311903,
+    "ic": 0.07206052695510962,
+    "auc": 0.5356705519601408,
+    "brier": 0.24853006983959625
+  },
+  "params": {
+    "horizon": 21,
+    "target_mode": "excess",
+    "bench_symbol": "SPY",
+    "scale_features": false,
+    "prune_low_variance": true,
+    "lgbm": {
+      "num_leaves": 255,
+      "max_depth": -1,
+      "learning_rate": 0.05,
+      "n_estimators": 1000,
+      "min_data_in_leaf": 30,
+      "feature_fraction": 0.9,
+      "bagging_fraction": 0.85,
+      "bagging_freq": 1,
+      "lambda_l2": 5.0,
+      "class_weight": "balanced"
+    }
+  }
+}
