@@ -1,0 +1,16 @@
+{
+  "CAGR":0.0,
+  "Vol":0.0,
+  "Sharpe":0.0,
+  "MaxDD":0.0,
+  "HitRate":0.0,
+  "Exposure":0.0,
+  "TurnoverYr":0.0,
+  "AvgHoldDays":0.0,
+  "STRAT":"hybrid",
+  "SIGNAL":"yhat",
+  "THRESH":0.565,
+  "SHIFT":1,
+  "TOPK":0,
+  "HYBRID_RANK":"yhat"
+}

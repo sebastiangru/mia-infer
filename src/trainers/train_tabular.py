@@ -1,89 +1,168 @@
-import os, joblib, mlflow, argparse, pandas as pd, numpy as np
-from sklearn.metrics import mean_squared_error, roc_auc_score, brier_score_loss
-from sklearn.calibration import CalibratedClassifierCV
-from sklearn.model_selection import TimeSeriesSplit
+import os, io, argparse, warnings
+import numpy as np
+import pandas as pd
+import joblib
+
+from azure.storage.blob import BlobClient
+import lightgbm as lgb
 from lightgbm import LGBMRegressor, LGBMClassifier
-from xgboost import XGBRegressor, XGBClassifier
-from src.io.blob_paths import features_csv
-from src.data.universe import load_universe
+from sklearn.calibration import CalibratedClassifierCV
+from sklearn.metrics import mean_absolute_error, roc_auc_score, brier_score_loss
 
-def load_features(tf: str, symbols: list[str]) -> pd.DataFrame:
-    dfs = []
-    for s in symbols:
-        try:
-            df = pd.read_csv(features_csv(tf, s))
-            df['symbol'] = s
-            dfs.append(df)
-        except Exception as e:
-            print(f"[WARN] {s}: {e}")
-    return pd.concat(dfs, ignore_index=True).sort_values(['symbol','time'])
+warnings.filterwarnings("ignore")
 
-def split_chrono(df: pd.DataFrame, dtcol='time', train_end=None, val_end=None):
-    df[dtcol] = pd.to_datetime(df[dtcol])
-    if train_end is None: train_end = df[dtcol].quantile(0.7)
-    if val_end   is None: val_end   = df[dtcol].quantile(0.85)
-    tr = df[df[dtcol] <= train_end]
-    va = df[(df[dtcol] > train_end) & (df[dtcol] <= val_end)]
-    te = df[df[dtcol] > val_end]
-    return tr, va, te
+def url_join(base: str, path: str, sas: str | None) -> str:
+    base = base[:-1] if base.endswith("/") else base
+    full = f"{base}/{path.lstrip('/')}"
+    if sas:
+        sep = "&" if "?" in full else "?"
+        full = f"{full}{sep}{sas}"
+    return full
+
+def read_csv_url(url: str) -> pd.DataFrame:
+    bc = BlobClient.from_blob_url(url)
+    data = bc.download_blob().readall()
+    return pd.read_csv(io.BytesIO(data))
+
+def pick_time_col(df: pd.DataFrame) -> str:
+    for c in ["time", "timestamp", "date", "Datetime", "datetime"]:
+        if c in df.columns:
+            return c
+    raise ValueError("No timestamp column found (expected one of: time, timestamp, date).")
+
+def build_target(df: pd.DataFrame) -> pd.Series:
+    if "close" in df.columns:
+        return np.log(df["close"]).diff().shift(-1)  # next-bar log return
+    for c in ["logret", "logret1", "ret1"]:
+        if c in df.columns:
+            return df[c].shift(-1)
+    raise ValueError("Could not derive target: need 'close' or a return column like 'logret'/'ret1'.")
+
+def load_universe(path: str | None) -> list[str]:
+    if path and os.path.exists(path):
+        return pd.read_csv(path)["symbol"].dropna().astype(str).tolist()
+    return ['AMZN','GD','NVDA','GOOGL','RHM.DE','PLTR','HIA1.F','RBI.VI',
+            'AMD','ASML','TSM','MRVL','SMCI','MRNA','CRSP','BNTX',
+            'ARGX','EXEL','SAGE','LDO.MI','BA.L','AIR.PA','HO.PA','HAG.DE']
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--tf", default="1d", choices=["15m","1h","1d"])
-    ap.add_argument("--algo", default="lgbm", choices=["lgbm","xgb"])
+    ap.add_argument("--algo", default="lgbm", choices=["lgbm"])
     ap.add_argument("--output", default="models")
-    ap.add_argument("--target", default="logret1", help="next-bar return column name in your CSV")
+    ap.add_argument("--universe_csv", default="configs/universe.csv")
     args = ap.parse_args()
 
-    mlflow.set_experiment(f"mia_{args.tf}_{args.algo}")
-    mlflow.autolog()
+    FEATURES_BASE = os.getenv("FEATURES_BASE", "https://miatradingdata.blob.core.windows.net/market-data/features")
+    FEATURES_SAS  = os.getenv("FEATURES_SAS", "")
 
-    symbols = load_universe()
-    df = load_features(args.tf, symbols)
+    symbols = load_universe(args.universe_csv)
 
-    # Select features (all numeric except leaks and ids)
-    drop_cols = {"time","symbol","timeframe"}
-    y = df[args.target].shift(-1)  # next period target (as in your files)
-    X = df.drop(columns=[c for c in drop_cols if c in df.columns], errors="ignore")
-    X = X.loc[y.index]
-    y = y.dropna()
-    X = X.loc[y.index]
+    # -------- Load & concatenate --------
+    frames = []
+    for sym in symbols:
+        path = f"{args.tf}/{sym}/{sym}_features_{args.tf}.csv"
+        url = url_join(FEATURES_BASE, path, FEATURES_SAS or None)
+        try:
+            df = read_csv_url(url)
+            df["symbol"] = sym
+            frames.append(df)
+            print(f"[OK] {sym} -> {len(df)} rows")
+        except Exception as e:
+            print(f"[WARN] {sym} skipped: {e}")
 
-    tr, va, te = split_chrono(pd.concat([X, y.rename("__y")], axis=1))
-    X_tr, y_tr = tr.drop(columns="__y"), tr["__y"]
-    X_va, y_va = va.drop(columns="__y"), va["__y"]
-    X_te, y_te = te.drop(columns="__y"), te["__y"]
+    if not frames:
+        raise SystemExit("No feature files loaded. Check FEATURES_BASE/SAS and folder layout.")
 
-    if args.algo == "lgbm":
-        reg = LGBMRegressor(n_estimators=1000, learning_rate=0.05, num_leaves=63)
-        clf = LGBMClassifier(n_estimators=400, learning_rate=0.05)
-    else:
-        reg = XGBRegressor(n_estimators=1000, max_depth=6, learning_rate=0.05, subsample=0.8, colsample_bytree=0.8, tree_method="hist")
-        clf = XGBClassifier(n_estimators=400, max_depth=5, learning_rate=0.05, subsample=0.9, colsample_bytree=0.9, tree_method="hist", eval_metric="logloss")
+    data = pd.concat(frames, ignore_index=True)
+    tcol = pick_time_col(data)
+    data[tcol] = pd.to_datetime(data[tcol])
 
-    reg.fit(X_tr, y_tr, eval_set=[(X_va, y_va)], verbose=False)
-    yhat = reg.predict(X_te)
+    # -------- Target & features --------
+    y = build_target(data)
 
-    # Prob-up head (sign)
-    y_sign_tr = (y_tr > 0).astype(int)
-    clf.fit(X_tr, y_sign_tr)
-    # Optionally calibrate
-    cal = CalibratedClassifierCV(clf, method="sigmoid", cv=3)
-    cal.fit(X_va, (y_va > 0).astype(int))
-    p_up = cal.predict_proba(X_te)[:,1]
+    drop_cols = {tcol, "symbol"}
+    X = data.drop(columns=[c for c in data.columns if c in drop_cols], errors="ignore")
+    # Keep only numeric & force float32 (robust with NumPy 2.0)
+    X = X.select_dtypes(include=[np.number]).astype(np.float32)
 
-    rmse = float(mean_squared_error(y_te, yhat, squared=False))
-    auc  = float(roc_auc_score((y_te>0).astype(int), p_up))
-    brier= float(brier_score_loss((y_te>0).astype(int), p_up))
+    valid = y.notna()
+    X = X.loc[valid]
+    y = y.loc[valid]
 
-    mlflow.log_metric("rmse_te", rmse)
-    mlflow.log_metric("auc_te", auc)
-    mlflow.log_metric("brier_te", brier)
+    # Chronological split (last 20% validation)
+    order = np.argsort(data.loc[valid, tcol].values)
+    X = X.iloc[order]
+    y = y.iloc[order]
+
+    n = len(X)
+    cut = int(n * 0.8)
+    X_train, X_val = X.iloc[:cut], X.iloc[cut:]
+    y_train, y_val = y.iloc[:cut], y.iloc[cut:]
+
+    # ---- Convert to NumPy (fix for NumPy 2.0 + LightGBM label path) ----
+    X_train_np = X_train.to_numpy(dtype=np.float32, copy=False)
+    X_val_np   = X_val.to_numpy(dtype=np.float32, copy=False)
+    y_train_np = y_train.to_numpy(dtype=np.float32, copy=False)
+    y_val_np   = y_val.to_numpy(dtype=np.float32, copy=False)
+
+    # ---- Regressor ----
+    reg = LGBMRegressor(
+        n_estimators=2000,
+        learning_rate=0.05,
+        num_leaves=64,
+        subsample=0.8,
+        colsample_bytree=0.8,
+        n_jobs=-1,
+        random_state=42,
+        verbosity=-1
+    )
+    # Regressor
+    reg.fit(
+    X_train, y_train_np,                              # <— X as DF, y as np
+    eval_set=[(X_val, y_val_np)],                     # <— X_val as DF, y_val as np
+    eval_metric="l2",
+    callbacks=[lgb.early_stopping(stopping_rounds=100),
+               lgb.log_evaluation(period=0)]
+)
+
+    # ---- Classifier (calibrated) ----
+    y_clf = (y > 0).astype(int)
+    y_clf_train, y_clf_val = y_clf.iloc[:cut], y_clf.iloc[cut:]
+    y_clf_train_np = y_clf_train.to_numpy(dtype=np.int32, copy=False)
+
+    base_clf = LGBMClassifier(
+        n_estimators=800,
+        learning_rate=0.05,
+        num_leaves=64,
+        subsample=0.8,
+        colsample_bytree=0.8,
+        n_jobs=-1,
+        random_state=42,
+        verbosity=-1
+    )
+    clf = CalibratedClassifierCV(estimator=base_clf, method="isotonic", cv=3)
+    clf.fit(X_train, y_clf_train_np)                      # <— X as DF, y as np
+
+    feature_list = X.columns.tolist()
+    os.makedirs(args.output, exist_ok=True)
+    with open(os.path.join(args.output, f"features_{args.tf}.json"), "w") as f:
+        import json; json.dump(feature_list, f)
 
     os.makedirs(args.output, exist_ok=True)
-    joblib.dump(reg, f"{args.output}/{args.algo}_{args.tf}_reg.pkl")
-    joblib.dump(cal, f"{args.output}/{args.algo}_{args.tf}_clf_cal.pkl")
-    print({"rmse":rmse,"auc":auc,"brier":brier})
+    reg_path = os.path.join(args.output, f"lgbm_{args.tf}_reg.pkl")
+    clf_path = os.path.join(args.output, f"lgbm_{args.tf}_clf_cal.pkl")
+    joblib.dump(reg, reg_path)
+    joblib.dump(clf, clf_path)
+
+    # Quick validation report
+    yhat = reg.predict(X_val_np)
+    p_up = clf.predict_proba(X_val_np)[:, 1]
+    mae = float(mean_absolute_error(y_val_np, yhat))
+    auc = float(roc_auc_score(y_clf_val.to_numpy(), p_up))
+    brier = float(brier_score_loss(y_clf_val.to_numpy(), p_up))
+    print({"val_mae": mae, "val_auc": auc, "val_brier": brier})
+    print(f"Saved: {reg_path}, {clf_path}")
 
 if __name__ == "__main__":
     main()

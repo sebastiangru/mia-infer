@@ -1,0 +1,38 @@
+{
+  "n_samples": 33056,
+  "n_features": 59,
+  "symbols_loaded": 15,
+  "symbols_skipped": 0,
+  "n_splits": 5,
+  "embargo_days": 5,
+  "oof": {
+    "rmse": NaN,
+    "ic": 0.03436285290103163,
+    "auc": 0.5114034493853997,
+    "brier": 0.24958353047691684
+  },
+  "params": {
+    "horizon": 10,
+    "target_mode": "excess",
+    "bench_symbol": "SPY",
+    "scale_features": true,
+    "xsec_zscore_features": false,
+    "prune_low_variance": true,
+    "use_regression_head": false,
+    "reg_objective": "huber",
+    "rank_reg_to_proba": true,
+    "half_life_days": 0,
+    "lgbm": {
+      "num_leaves": 31,
+      "max_depth": -1,
+      "learning_rate": 0.03,
+      "n_estimators": 800,
+      "min_data_in_leaf": 200,
+      "feature_fraction": 0.8,
+      "bagging_fraction": 0.8,
+      "bagging_freq": 1,
+      "lambda_l2": 5.0,
+      "class_weight": null
+    }
+  }
+}
