@@ -1,0 +1,11 @@
+mode: "long_only"
+top_k: 5
+weight_cap: 0.10
+sector_cap: 0.30
+cost_bps_roundtrip: 15
+slip_bps: 5
+rebalance: "daily"
+gates:
+  min_prob_up: 0.53
+risk:
+  vol_target: null

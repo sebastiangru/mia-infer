@@ -1,6 +1,13 @@
-price_base: "market-data/market-data/1d"
-macro_base: "market-data/macro/1d"
-universe_csv: "configs/universe.csv"
+remote:
+  enabled: true
+  blob_base_env: "BLOB_BASE"   # set in .env, e.g. https://miatradingdata.blob.core.windows.net/market-data?...sig=...
+
+# IMPORTANT: these are RELATIVE paths under the blob **container** in BLOB_BASE
+price_base:   "market-data/1d"   # raw prices: market-data/1d/<SYM>/<SYM>_1d.csv
+feature_base: "features/1d"      # equity features: features/1d/<SYM>/<SYM>_features_1d.csv
+macro_base:   "macro/1d"         # macro features: macro/1d/<SYM>/<SYM>_features_1d.csv
+
+universe_csv: "configs/universe.csv"         # local file (fine to keep local)
 benchmark: "SPY"
 join_strategy: "left"
 macro_ffill: true
